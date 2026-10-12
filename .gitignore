@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.deps/
+vendor/
+*.pt
+*.pth
+*.ckpt
+.ipynb_checkpoints/
+training_data/

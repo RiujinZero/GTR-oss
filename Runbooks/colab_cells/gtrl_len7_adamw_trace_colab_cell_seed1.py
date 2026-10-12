@@ -1,0 +1,151 @@
+"""AdamW length=7 breakout trace, seed 1, on Colab: paste this whole file into one cell.
+
+Same config as gtrl_len7_adamw_trace_seed0 (which finished 2026-08-09:
+breakout at step ~15,000 but never got past a noisy 14-18% plateau, no
+exact-match mastery -- see Runbooks/GTRL_ADAMW_BREAKOUT_LOG.md), just
+--seed changed 0 -> 1. User's call (2026-08-09): "Yea, the GTR-L is
+fickle. Let me relaunch with seed 1" -- checking whether the plateau
+outcome is seed-specific or a stable property of this architecture/task
+combination at 100k steps. --graph-seed is left at 0 (that flag controls
+the fixed small-world graph topology, not training/init randomness) --
+only the training seed changes, matching how "seed 1" is used elsewhere
+in this project (e.g. the GTR-ARW seed1/seed2 comparisons).
+
+Runs in the foreground (blocks this cell until it finishes) -- Colab is
+more aggressive about reclaiming a runtime that has no actively-running
+foreground cell, so a detached background subprocess risks the whole VM
+getting killed even with the tab open.
+
+**Log sync fix (2026-08-09):** earlier versions of this cell piped the
+training subprocess's stdout/stderr directly into a file opened on the
+Drive FUSE mount and held open for the entire run. Drive doesn't appear
+to sync that kind of long-held, continuously-appended file handle on its
+own (checkpoints sync fine because torch.save does a discrete open-write-
+close per file) -- user had to manually click the file in Colab's file
+browser to force a sync. Fix: write the logs to a LOCAL file instead, and
+run a background thread that copies the local file over the Drive path
+every 30s via a fresh open-write-close (shutil.copy2), the same kind of
+discrete write that makes checkpoints sync reliably. A final sync also
+runs after the process exits so the last lines aren't lost.
+
+Setup (one time): gtrl_evotoken_bundle.zip already at
+MyDrive/GTR-L/gtrl_evotoken_bundle.zip (confirmed fresh, includes the
+config-dump feature and AdamWWeightTracer as of 2026-08-08).
+"""
+
+import shutil
+import subprocess
+import sys
+import threading
+import zipfile
+from pathlib import Path
+
+from google.colab import drive  # type: ignore[import-not-found]
+
+drive.mount("/content/drive")
+
+DRIVE_ROOT = Path("/content/drive/MyDrive/GTR-L")
+BUNDLE = DRIVE_ROOT / "gtrl_evotoken_bundle.zip"
+if not BUNDLE.exists():
+    raise FileNotFoundError(f"Expected the bundle at {BUNDLE}")
+
+CODE_DIR = Path("/content/GTR_len7_adamw_trace_seed1")
+if CODE_DIR.exists():
+    shutil.rmtree(CODE_DIR)
+CODE_DIR.mkdir(parents=True)
+with zipfile.ZipFile(BUNDLE) as zf:
+    zf.extractall(CODE_DIR)
+sys.path.insert(0, str(CODE_DIR))
+
+RUN_ROOT = DRIVE_ROOT / "gtrl_len7_adamw_trace_seed1"
+CHECKPOINT_DIR = RUN_ROOT / "checkpoint"
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+STDOUT_LOG = RUN_ROOT / "train.stdout.log"
+STDERR_LOG = RUN_ROOT / "train.stderr.log"
+
+LOCAL_DIR = Path("/content/local_logs_seed1")
+LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_STDOUT = LOCAL_DIR / "train.stdout.log"
+LOCAL_STDERR = LOCAL_DIR / "train.stderr.log"
+
+args = [
+    sys.executable, "-u", str(CODE_DIR / "gator_linear_prefix_train.py"),
+    "--optimizer", "adamw",
+    "--steps", "100000",
+    "--batch-size", "144",
+    "--eval-batch-size", "512",
+    "--prefix-episode-mode", "fresh",
+    "--length", "7",
+    "--streams", "10",
+    "--nodes", "40",
+    "--width", "8",
+    "--relays", "4",
+    "--degree", "6",
+    "--buses", "4",
+    "--mailbox-channels", "4",
+    "--mailbox-width", "8",
+    "--basis-rank", "4",
+    "--address-width", "4",
+    "--router-rank", "8",
+    "--conv-kernel", "3",
+    "--graph-layout", "small_world",
+    "--graph-seed", "0",
+    "--graph-rewire", "0.5",
+    "--ingress-temperature", "1.0",
+    "--device", "auto",
+    "--amp-dtype", "none",
+    "--log-every", "500",
+    "--checkpoint-dir", str(CHECKPOINT_DIR),
+    "--hard-routing",
+    "--no-scan-normalise",
+    "--temperature-start", "1.0",
+    "--temperature-min", "1.0",
+    "--temperature-decay", "1.0",
+    "--balanced-prefix-batches",
+    "--prefix-loss-vocabulary", "valid",
+    "--learning-rate", "3e-3",
+    "--weight-decay", "1e-4",
+    "--gradient-clip", "1.0",
+    "--adamw-weight-trace-every", "500",
+    "--adamw-weight-trace-dir", str(CHECKPOINT_DIR / "adamw_weight_trace"),
+    "--seed", "1",
+]
+
+print(f"local stdout: {LOCAL_STDOUT} -> synced to {STDOUT_LOG}")
+print(f"local stderr: {LOCAL_STDERR} -> synced to {STDERR_LOG}")
+print(f"trace artifacts: {CHECKPOINT_DIR / 'adamw_weight_trace'}")
+print("Running in the foreground -- this cell blocks until the run finishes.")
+print("Logs sync to Drive every 900s via a background thread (discrete")
+print("open-write-close per sync, like checkpoints -- not a held-open handle;")
+print("kept infrequent so Drive doesn't rate-limit/complain).")
+print()
+
+sync_stop = threading.Event()
+
+
+def _sync_logs_to_drive():
+    while not sync_stop.is_set():
+        for local, remote in ((LOCAL_STDOUT, STDOUT_LOG), (LOCAL_STDERR, STDERR_LOG)):
+            if local.exists():
+                shutil.copy2(local, remote)
+        sync_stop.wait(900)
+
+
+sync_thread = threading.Thread(target=_sync_logs_to_drive, daemon=True)
+sync_thread.start()
+
+with LOCAL_STDOUT.open("w") as out, LOCAL_STDERR.open("w") as err:
+    result = subprocess.run(
+        args,
+        cwd=str(CODE_DIR),
+        stdout=out,
+        stderr=err,
+    )
+
+sync_stop.set()
+sync_thread.join(timeout=5)
+for local, remote in ((LOCAL_STDOUT, STDOUT_LOG), (LOCAL_STDERR, STDERR_LOG)):
+    if local.exists():
+        shutil.copy2(local, remote)
+
+print(f"process exited with code {result.returncode}")
